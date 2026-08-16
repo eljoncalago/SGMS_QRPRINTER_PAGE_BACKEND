@@ -1,28 +1,25 @@
 /**
- * QR Generator QR Service
- * Handles QR token generation, batch generation, and validation
+ * SGMS QR Service
+ * Handles QR token generation and validation
  */
 
-/**
- * Handle generate student QR (single student)
- * If an active token already exists, returns it instead of creating a new one.
- */
 function handleGenerateStudentQR(payload, token) {
   try {
     const adminId = getAdminIdFromToken(token);
     const { studentId } = payload;
-
+    
     if (!studentId) {
       return createResponse({ success: false, message: 'Student ID is required', data: null });
     }
-
+    
     const student = findRecordById(CONFIG.SHEETS.STUDENTS, 'STUDENT_ID', studentId);
     if (!student) {
       return createResponse({ success: false, message: 'Student not found', data: null });
     }
-
+    
     // Check for existing active token
     const existingTokens = findRecords(CONFIG.SHEETS.QR_TOKENS, { STUDENT_ID: studentId, IS_ACTIVE: true });
+    
     if (existingTokens.length > 0) {
       return createResponse({
         success: true,
@@ -30,9 +27,10 @@ function handleGenerateStudentQR(payload, token) {
         data: { token: existingTokens[0].TOKEN, qrUrl: generateQRUrl(existingTokens[0].TOKEN) }
       });
     }
-
+    
     // Generate new secure token
     const qrToken = generateSecureToken();
+    
     const tokenRecord = {
       TOKEN_ID: generateId('QRT'),
       TOKEN: qrToken,
@@ -42,10 +40,11 @@ function handleGenerateStudentQR(payload, token) {
       EXPIRES_AT: '',
       LAST_ACCESSED_AT: new Date().toISOString()
     };
-
+    
     insertRecord(CONFIG.SHEETS.QR_TOKENS, tokenRecord);
-    createAuditLog(adminId, 'GENERATE_QR', studentId, null, null, 'web', 'Generated QR for: ' + student.ENGLISH_NAME);
-
+    
+    createAuditLog(adminId, 'GENERATE_QR', studentId, null, null, null, 'web', 'Generated QR for: ' + student.ENGLISH_NAME);
+    
     return createResponse({
       success: true,
       message: 'QR token generated',
@@ -57,9 +56,20 @@ function handleGenerateStudentQR(payload, token) {
 }
 
 /**
- * Handle batch QR generation
- * Generates QR tokens for multiple students at once.
- * Returns an array of { studentId, englishName, thaiName, section, classNumber, token, qrUrl }
+ * Handle batch QR generation (ADDED for QR Printer app)
+ * Generates/reuses QR tokens for multiple students at once and returns
+ * everything the print layout needs in one call: names, class/section,
+ * token, and the QR image URL.
+ *
+ * IMPORTANT: This reads/writes the SAME QR_TOKENS sheet as
+ * handleGenerateStudentQR, so a student who already has an active token
+ * (e.g. generated earlier from the main SGMS app's "Generate QR Codes"
+ * page) will get that SAME token back here — the printed QR will always
+ * match the one already on file, never a duplicate/mismatched one.
+ *
+ * Returns an array of:
+ *   { studentId, englishName, thaiName, gradeLevel, section, classNumber, token, qrUrl }
+ * or, per-item, { studentId, error } if a student was not found.
  */
 function handleGenerateBatchQR(payload, token) {
   try {
@@ -79,7 +89,9 @@ function handleGenerateBatchQR(payload, token) {
         return;
       }
 
-      // Check for existing active token
+      // Reuse an existing active token if one already exists for this
+      // student (e.g. created earlier via handleGenerateStudentQR), so the
+      // printed QR always matches the QR already on record.
       const existingTokens = findRecords(CONFIG.SHEETS.QR_TOKENS, { STUDENT_ID: studentId, IS_ACTIVE: true });
       let qrToken;
 
@@ -111,7 +123,7 @@ function handleGenerateBatchQR(payload, token) {
       });
     });
 
-    createAuditLog(adminId, 'GENERATE_BATCH_QR', null, null, JSON.stringify({ count: results.length }), 'web', 'Batch generated QR for ' + results.length + ' students');
+    createAuditLog(adminId, 'GENERATE_BATCH_QR', null, null, null, JSON.stringify({ count: results.length }), 'web', 'Batch generated QR for ' + results.length + ' students');
 
     return createResponse({
       success: true,
@@ -123,54 +135,42 @@ function handleGenerateBatchQR(payload, token) {
   }
 }
 
-/**
- * Handle validate QR (public endpoint - used by QR scanners)
- */
 function handleValidateQR(payload) {
   try {
     const { token } = payload;
-
+    
     if (!token) {
       return createResponse({ success: false, message: 'Token is required', data: null });
     }
-
+    
     const tokenRecords = findRecords(CONFIG.SHEETS.QR_TOKENS, { TOKEN: token, IS_ACTIVE: true });
+    
     if (tokenRecords.length === 0) {
       return createResponse({ success: false, message: 'Invalid QR token', data: null });
     }
-
+    
     const tokenRecord = tokenRecords[0];
     const student = findRecordById(CONFIG.SHEETS.STUDENTS, 'STUDENT_ID', tokenRecord.STUDENT_ID);
+    
     if (!student) {
       return createResponse({ success: false, message: 'Student not found', data: null });
     }
-
+    
     // Update last accessed
     updateRecord(CONFIG.SHEETS.QR_TOKENS, 'TOKEN_ID', tokenRecord.TOKEN_ID, {
       LAST_ACCESSED_AT: new Date().toISOString()
     });
-
+    
     return createResponse({
       success: true,
       message: 'QR token validated',
-      data: {
-        studentId: student.STUDENT_ID,
-        englishName: student.ENGLISH_NAME,
-        thaiName: student.THAI_NAME,
-        gradeLevel: student.GRADE_LEVEL,
-        section: student.SECTION_NUMBER,
-        classNumber: student.CLASS_NUMBER,
-        student: student
-      }
+      data: { studentId: student.STUDENT_ID, studentName: student.ENGLISH_NAME, student: student }
     });
   } catch (error) {
     return createResponse({ success: false, message: error.toString(), data: null });
   }
 }
 
-/**
- * Generate a secure random token
- */
 function generateSecureToken() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let token = '';
@@ -180,9 +180,6 @@ function generateSecureToken() {
   return token;
 }
 
-/**
- * Generate QR code URL using public QR code API
- */
 function generateQRUrl(token) {
-  return 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(token);
+  return `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(token)}`;
 }
